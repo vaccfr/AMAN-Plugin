@@ -1,0 +1,17 @@
+//
+// Created by Hawai on 9/5/2026.
+//
+// Generated from src/Version.h.in by CMake's configure_file into
+// ${CMAKE_BINARY_DIR}/Version.h. Edit the template, never the generated copy.
+//
+
+#ifndef AMAN_PLUGIN_VERSION_H
+#define AMAN_PLUGIN_VERSION_H
+
+#define PLUGIN_NAME          "@PROJECT_NAME@"
+#define PLUGIN_VERSION       "@PROJECT_VERSION@"
+#define PLUGIN_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define PLUGIN_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define PLUGIN_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#endif //AMAN_PLUGIN_VERSION_H
