@@ -57,12 +57,6 @@ IF (MSVC)
     ENDFOREACH()
 ENDIF ()
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    add_compile_definitions(DIR_SEPARATOR="\\\\")
-else()
-    add_compile_definitions(DIR_SEPARATOR="/")
-endif()
-
 if(DEV)
     message(STATUS "Development mode enabled")
     add_compile_definitions(DEV=1)
