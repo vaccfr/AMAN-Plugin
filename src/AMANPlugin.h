@@ -22,13 +22,36 @@
 
 using namespace EuroScopePlugIn;
 
+struct ESB_Api_v1;
+struct ESB_Provider;
+
 namespace amanplugin
 {
 
 class AMANPlugin : public CPlugIn
 {
     static constexpr int PERIODIC_POST_TIME_INTERVAL = 5; // seconds
-    static constexpr const char* API_URL = ""; //TODO:
+    static constexpr int CONFIG_REFRESH_INTERVAL = 60; // seconds
+    static constexpr const char* API_URL = "aman-vatsim.lunair.fr";
+    static constexpr int MAX_IAF_LOOKUP_IN_ROUTE = 20; // Max number of waypoint after IAF (used to limit search time per route)
+
+    struct Flight
+    {
+        std::string callsign;   // required every snapshot
+        std::string aircraType;  // required every snapshot
+        std::string departure;  // required every snapshot
+        std::string iaf;        // required every snapshot
+        std::string iafEta;     // required every snapshot
+        int altitude;
+        int verticalSpeed;
+        int finalAltitude;
+        int groundspeed;
+        double latitude;
+        double longitude;
+
+        Flight(const std::string& callsign, const std::string& aicraType, const std::string& departure, const std::string& iaf, const std::string& iafEta, int altitude = 0, int verticalSpeed = 0, int finalAltitude = 0, int groundspeed = 0, double latitude = 0.0, double longitude = 0.0)
+            : callsign(callsign), aircraType(aicraType), departure(departure), iaf(iaf), iafEta(iafEta), altitude(altitude), verticalSpeed(verticalSpeed), finalAltitude(finalAltitude), groundspeed(groundspeed), latitude(latitude), longitude(longitude) {}
+    };
 
 public:
     AMANPlugin();
@@ -50,8 +73,13 @@ public:
 
 private:
     void WorkerThread();
-    void PostSnapshotsToAPI(httplib::Client& cli);
     void GetCompatibleICAOs(httplib::Client& cli);
+    void GetIAFsForICAO(httplib::Client& cli, const std::string& icao);
+    void RefreshConfig(httplib::Client& cli);
+    void PostSnapshotsToAPI(httplib::Client& cli, const std::string& icao);
+
+    bool RegisterProvider();
+    void PublishIAFsToBridge();
 
 private:
     // Plugin state
@@ -59,7 +87,16 @@ private:
     bool printError = true;
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
-    
+    std::atomic<bool> iafUpdateRequired{false};
+
+    // Bridge
+    const ESB_Api_v1* api_ = nullptr;
+    ESB_Provider* provider_ = nullptr;
+    bool providerConflict_ = false;   // Another module owns "amanplugin"
+    int missingTicks_ = 0;
+    bool missingReported_ = false;    // ESB_MISSING_MESSAGE is said once
+    uint32_t iafField_ = 0;          // 0 == still unresolved
+
     // Message management
     std::mutex messageQueueMutex_;
     std::vector<std::pair<std::string, bool>> messageQueue_; // Pair of message and isError flag
@@ -70,6 +107,11 @@ private:
     std::mutex trackedICAOsMutex_;
     std::unordered_set<std::string> trackedICAOs_; // ICAOs for which to send snapshots
 
+    std::mutex snapshotMapMutex_;
+    std::unordered_map<std::string, std::vector<Flight>> snapshotMap_; // Map of ICAOs to their snapshots
+
+    std::mutex iafMapMutex_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> iafMap_; // Map of ICAOs to their IAFs
 };
 
 } // namespace amanplugin
