@@ -16,6 +16,33 @@
 namespace amanplugin
 {
 
+inline bool TryToParseICAOs(std::unordered_set<std::string>& parsedICAOs, const std::string& line, const std::unordered_set<std::string>& compatibleICAOs)
+{
+    std::istringstream iss(line);
+    std::string icao;
+    while (iss >> icao)
+    {
+        if (icao == "aman") continue; // Skip the command itself
+
+        if (icao.size() != 4 || !std::all_of(icao.begin(), icao.end(), ::isalpha))
+        {
+            // Invalid ICAO format, skip it
+            continue;
+        }
+
+        std::transform(icao.begin(), icao.end(), icao.begin(), ::toupper);
+
+        if (!compatibleICAOs.contains(icao))
+        {
+            // ICAO not in the list of compatible ICAOs, skip it
+            continue;
+        }
+
+        parsedICAOs.insert(icao);
+    }
+    return !parsedICAOs.empty();
+}
+
 inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
 {
     if (sCommandLine == nullptr) return false;
@@ -51,13 +78,32 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
     iss >> sub;
     sub = toLower(sub);
 
+
+    std::unordered_set<std::string> icaoList;
+
+    std::unordered_set<std::string> compatibleICAOs;
+    {
+        std::lock_guard<std::mutex> lock(compatibleICAOsMutex_);
+        compatibleICAOs = compatibleICAOs_;
+    }
+
     if (sub == "version")
     {
         DisplayMessage(std::string("AMAN Plugin version: ") + PLUGIN_VERSION);
         return true;
     }
+    else if (TryToParseICAOs(icaoList, line, compatibleICAOs))
+    {
+        // User provided ICAOs list or Position: example: .aman LFPG LFPO
+        std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
+        trackedICAOs_ = std::move(icaoList);
+        DisplayMessage("Tracking ICAOs updated.");
+        return true;
+    }
 
+    // no command recognized, display help
     DisplayMessage("Commands: .aman version");
+    DisplayMessage("Commands: .aman <ICAO1> <ICAO2> ...");
     return true;
 }
 

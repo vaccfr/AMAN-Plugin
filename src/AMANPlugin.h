@@ -14,8 +14,11 @@
 #include <mutex>
 #include <vector>
 #include <utility>
+#include <unordered_set>
 
 #include <EuroScopePlugIn.h>
+
+#include <httplib.h>
 
 using namespace EuroScopePlugIn;
 
@@ -24,6 +27,9 @@ namespace amanplugin
 
 class AMANPlugin : public CPlugIn
 {
+    static constexpr int PERIODIC_POST_TIME_INTERVAL = 5; // seconds
+    static constexpr const char* API_URL = ""; //TODO:
+
 public:
     AMANPlugin();
     ~AMANPlugin();
@@ -44,6 +50,8 @@ public:
 
 private:
     void WorkerThread();
+    void PostSnapshotsToAPI(httplib::Client& cli);
+    void GetCompatibleICAOs(httplib::Client& cli);
 
 private:
     // Plugin state
@@ -55,6 +63,13 @@ private:
     // Message management
     std::mutex messageQueueMutex_;
     std::vector<std::pair<std::string, bool>> messageQueue_; // Pair of message and isError flag
+
+    std::mutex compatibleICAOsMutex_;
+    std::unordered_set<std::string> compatibleICAOs_; // ICAOs that are compatible
+
+    std::mutex trackedICAOsMutex_;
+    std::unordered_set<std::string> trackedICAOs_; // ICAOs for which to send snapshots
+
 };
 
 } // namespace amanplugin
