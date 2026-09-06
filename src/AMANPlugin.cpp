@@ -2,6 +2,10 @@
 // Created by Hawai on 9/5/2026.
 //
 
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
+
 #include <nlohmann/json.hpp>
 
 #include "AMANPlugin.h"
@@ -21,8 +25,31 @@ using namespace EuroScopePlugIn;
 static constexpr const char* PROVIDER_ID = "amanplugin";
 static constexpr const char* IAF_FIELD = "iaf";
 
+/// CoFrance owns these. It integrates a wind-aware trajectory per flight, which
+/// this plugin does not, so the ETA over an IAF is read rather than computed.
+static constexpr const char* COFRANCE_ETA_IAF = "cofrance/eta_iaf";
+static constexpr const char* COFRANCE_IAF = "cofrance/iaf";
+
 /// The bridge is declared missing only after it has had a fair chance to load.
 static constexpr int MISSING_TICKS_BEFORE_NOTICE = 10;
+
+/// Fix names are five characters; this is only ever read into for a comparison.
+static constexpr uint32_t VALUE_BUFFER = 32;
+
+/// Render UTC Unix seconds as the "HH:MM:SS" the feed API expects. Empty on a
+/// timestamp the CRT will not convert, which the caller turns into a JSON null.
+static std::string FormatUtcHms(int64_t epochSeconds)
+{
+    const std::time_t seconds = static_cast<std::time_t>(epochSeconds);
+    std::tm utc = {};
+    if (gmtime_s(&utc, &seconds) != 0) return {};
+
+    char buf[16];
+    const int written = std::snprintf(buf, sizeof buf, "%02d:%02d:%02d",
+                                      utc.tm_hour, utc.tm_min, utc.tm_sec);
+    if (written <= 0) return {};
+    return std::string(buf, static_cast<size_t>(written));
+}
 
 const ESB_FieldDecl FIELDS[] = {
     {
@@ -133,6 +160,8 @@ void AMANPlugin::OnTimer(int Counter)
 
     if (provider_ == nullptr && !providerConflict_) RegisterProvider();
 
+    if (cofranceEtaField_ == 0 || cofranceIafField_ == 0) ResolveConsumedFields();
+
 
     {
         // Drain message queue
@@ -184,25 +213,31 @@ void AMANPlugin::OnTimer(int Counter)
 
             auto route = fp.GetExtractedRoute();
             int pointNumber = route.GetPointsNumber();
+            // Hoisted: the destination decides the IAF set, not the individual fix,
+            // and the old form re-hashed destIcao on every point it looked at.
+            const auto iafsForDest = iafMap.find(destIcao);
+            if (iafsForDest == iafMap.end()) continue;
+
+            const std::string callsign = rt.GetCallsign();
+
             for (int i = pointNumber - 1; i >= std::max(0, pointNumber - MAX_IAF_LOOKUP_IN_ROUTE); --i) {
                 std::string fix = route.GetPointName(i);
-                if (iafMap.contains(destIcao) && iafMap[destIcao].contains(fix))
-                {
-                    flightsMap[destIcao].emplace_back(
-                        rt.GetCallsign(),
-                        fp.GetFlightPlanData().GetAircraftFPType(),
-                        fp.GetFlightPlanData().GetOrigin(),
-                        fix,
-                        "", //TODO: get from CoFrance
-                        pos.GetFlightLevel(),
-                        pos.GetVerticalSpeed(), // Get from CoFrance
-                        fp.GetFlightPlanData().GetFinalAltitude(),
-                        pos.GetReportedGS(),
-                        pos.GetPosition().m_Latitude,
-                        pos.GetPosition().m_Longitude
-                    );
-                }
-                break;
+                if (iafsForDest->second.contains(fix) == false) continue;
+
+                flightsMap[destIcao].emplace_back(
+                    callsign,
+                    fp.GetFlightPlanData().GetAircraftFPType(),
+                    fp.GetFlightPlanData().GetOrigin(),
+                    fix,
+                    GetIafEtaFromBridge(callsign, fix),
+                    pos.GetFlightLevel(),
+                    rt.GetVerticalSpeed(),
+                    fp.GetFlightPlanData().GetFinalAltitude(),
+                    pos.GetReportedGS(),
+                    pos.GetPosition().m_Latitude,
+                    pos.GetPosition().m_Longitude
+                );
+                break;   // first IAF found scanning back from the destination
             }
         }
 
@@ -240,7 +275,7 @@ void AMANPlugin::WorkerThread()
     while (m_stop.load(std::memory_order_acquire) == false)
     {
 
-        if (counter % PERIODIC_POST_TIME_INTERVAL == 5)
+        if (counter % PERIODIC_POST_TIME_INTERVAL == 0)
         {
             for (const auto& icao : trackedICAOs_)
             {
@@ -312,7 +347,7 @@ void AMANPlugin::GetIAFsForICAO(httplib::Client& cli, const std::string& icao)
         return;
     }
 
-    if (res->status != 200) {
+    if (res->status != 200 && res->status != 202) {
         if (printError) {
             printError = false;
             QueueError("Unexpected response from the AMAN API server for ICAO " + icao + ": " + std::to_string(res->status));
@@ -384,7 +419,8 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         flightJson["aircraftType"] = flight.aircraType;
         flightJson["departure"] = flight.departure;
         flightJson["iaf"] = flight.iaf;
-        flightJson["eta_iaf_utc"] = flight.iafEta;
+        if (flight.iafEta.empty()) flightJson["eta_iaf_utc"] = nullptr;
+        else flightJson["eta_iaf_utc"] = flight.iafEta;
         flightJson["altitude"] = flight.altitude;
         flightJson["verticalSpeed"] = flight.verticalSpeed;
         flightJson["finalAltitude"] = flight.finalAltitude;
@@ -407,7 +443,7 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         return;
     }
 
-    if (res->status != 200) {
+    if (res->status != 200 && res->status != 202) {
         if (printError) {
             printError = false;
             QueueError("Unexpected response from the AMAN API server for ICAO " + icao + ": " + std::to_string(res->status));
@@ -479,5 +515,54 @@ void AMANPlugin::PublishIAFsToBridge()
 
     ESB_Value value = ESB_Str(iafString.c_str());
     api_->set_global(provider_, iafField_, &value);
+}
+
+void AMANPlugin::ResolveConsumedFields()
+{
+    if (api_ == nullptr) return;
+
+    // ESB_E_NO_PROVIDER simply means CoFrance has not registered yet; leaving the
+    // ids at 0 makes the next tick try again. Resolve, not own_field: these are
+    // CoFrance's fields and we only ever read them.
+    if (cofranceEtaField_ == 0)
+        api_->resolve(COFRANCE_ETA_IAF, ESB_T_I64, &cofranceEtaField_);
+    if (cofranceIafField_ == 0)
+        api_->resolve(COFRANCE_IAF, ESB_T_STR, &cofranceIafField_);
+}
+
+std::string AMANPlugin::GetIafEtaFromBridge(const std::string& callsign,
+                                            const std::string& iaf) const
+{
+    if (api_ == nullptr || callsign.empty()) return {};
+    if (cofranceEtaField_ == ESB_FIELD_NONE || cofranceIafField_ == ESB_FIELD_NONE) return {};
+
+    ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
+    if (api_->aircraft(callsign.c_str(), &aircraft) != ESB_OK) return {};
+
+    // Which fix the published time is over. Checked first so a disagreement costs
+    // one read instead of two, and so the ETA is never accepted unlabelled.
+    char fixBuf[VALUE_BUFFER];
+    ESB_Value published = {};
+    uint32_t fixBytes = sizeof fixBuf;
+
+    // ESB_E_UNSET is the ordinary answer: CoFrance clears both fields as soon as a
+    // flight passes its IAF or is vectored off the route it was predicted along.
+    if (api_->get_ac(aircraft, cofranceIafField_, &published, fixBuf, &fixBytes) != ESB_OK) return {};
+    if (published.type != ESB_T_STR) return {};
+
+    const std::string publishedIaf(fixBuf, (std::min)(published.bytes,
+                                                      static_cast<uint32_t>(sizeof fixBuf)));
+    if (publishedIaf != iaf) return {};
+
+    char etaBuf[VALUE_BUFFER];
+    ESB_Value eta = {};
+    uint32_t etaBytes = sizeof etaBuf;
+
+    // A scalar needs no payload buffer, but one is passed anyway rather than relying
+    // on the bridge tolerating a null for an I64 read.
+    if (api_->get_ac(aircraft, cofranceEtaField_, &eta, etaBuf, &etaBytes) != ESB_OK) return {};
+    if (eta.type != ESB_T_I64) return {};
+
+    return FormatUtcHms(eta.v.i64);
 }
 

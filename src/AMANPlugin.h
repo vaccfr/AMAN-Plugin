@@ -81,6 +81,23 @@ private:
     bool RegisterProvider();
     void PublishIAFsToBridge();
 
+    /// Resolve the fields we read from CoFrance. Retried from OnTimer until they
+    /// land: EuroScope loads plugins in the order the user's settings file lists
+    /// them, so CoFrance may well register after we do.
+    void ResolveConsumedFields();
+
+    /// CoFrance's predicted ETA over @p iaf for @p callsign, formatted "HH:MM:SS"
+    /// UTC. Empty whenever there is no honest answer - bridge absent, CoFrance not
+    /// loaded, nothing published for this flight, or the aircraft has passed the
+    /// fix - and empty is serialised as a bare null rather than "".
+    ///
+    /// The published fix is checked against @p iaf before the time is accepted.
+    /// CoFrance scans the whole remaining route while this plugin scans a window at
+    /// the end of it, so the two can legitimately land on different fixes; an ETA
+    /// over a fix we are not reporting is worse than none.
+    std::string GetIafEtaFromBridge(const std::string& callsign,
+                                    const std::string& iaf) const;
+
 private:
     // Plugin state
     bool initialized_ = false;
@@ -96,6 +113,11 @@ private:
     int missingTicks_ = 0;
     bool missingReported_ = false;    // ESB_MISSING_MESSAGE is said once
     uint32_t iafField_ = 0;          // 0 == still unresolved
+
+    // Read from CoFrance, which owns them. eta_iaf is UTC Unix seconds; iaf names
+    // the fix that time is over. 0 == still unresolved.
+    uint32_t cofranceEtaField_ = 0;
+    uint32_t cofranceIafField_ = 0;
 
     // Message management
     std::mutex messageQueueMutex_;
