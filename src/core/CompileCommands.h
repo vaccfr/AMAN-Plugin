@@ -92,6 +92,51 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
         DisplayMessage(std::string("AMAN Plugin version: ") + PLUGIN_VERSION);
         return true;
     }
+    else if (sub == "icao")
+    {
+        std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
+        if (trackedICAOs_.empty())
+        {
+            DisplayMessage("No ICAOs are currently being tracked.");
+        }
+        else
+        {
+            std::string icaoListStr;
+            for (const auto& icao : trackedICAOs_)
+            {
+                if (!icaoListStr.empty()) icaoListStr += " ";
+                icaoListStr += icao;
+            }
+            DisplayMessage("Currently tracked ICAOs: " + icaoListStr);
+        }
+        return true;
+    }
+    else if (sub == "clear")
+    {
+        std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
+        trackedICAOs_.clear();
+        DisplayMessage("Tracking ICAOs cleared.");
+        return true;
+    }
+    else if (sub == "available")
+    {
+        std::lock_guard<std::mutex> lock(compatibleICAOsMutex_);
+        if (compatibleICAOs_.empty())
+        {
+            DisplayMessage("No ICAOs are currently available.");
+        }
+        else
+        {
+            std::string icaoListStr;
+            for (const auto& icao : compatibleICAOs_)
+            {
+                if (!icaoListStr.empty()) icaoListStr += " ";
+                icaoListStr += icao;
+            }
+            DisplayMessage("Available ICAOs: " + icaoListStr);
+        }
+        return true;
+    }
     else if (TryToParseICAOs(icaoList, line, compatibleICAOs))
     {
         // User provided ICAOs list or Position: example: .aman LFPG LFPO
@@ -102,8 +147,11 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
     }
 
     // no command recognized, display help
-    DisplayMessage("Commands: .aman version");
-    DisplayMessage("Commands: .aman <ICAO1> <ICAO2> ...");
+    DisplayMessage("Commands: .aman version    Display AMAN Plugin version");
+    DisplayMessage("Commands: .aman <ICAO1> <ICAO2> ...    Activate reporting for the specified ICAOs");
+    DisplayMessage("Commands: .aman icao    Display currently tracked ICAOs");
+    DisplayMessage("Commands: .aman clear    Clear the list of tracked ICAOs");
+    DisplayMessage("Commands: .aman available    Display the list of available ICAOs");
     return true;
 }
 
