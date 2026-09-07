@@ -23,6 +23,7 @@ using namespace EuroScopePlugIn;
 /// Claimed namespace on the bridge. A conflict is settled with the other
 /// author, not retried around, so a taken id is reported once and dropped.
 static constexpr const char* PROVIDER_ID = "amanplugin";
+static constexpr const char* RWY_FIELD = "rwy";
 static constexpr const char* IAF_FIELD = "iaf";
 
 /// CoFrance owns these. It integrates a wind-aware trajectory per flight, which
@@ -60,6 +61,14 @@ const ESB_FieldDecl FIELDS[] = {
         97u, // 5 Char per IAF + 1 for comma + 1 for null terminator, max 16 IAFs
         "AMAN list of IAFs tracked",
     },
+    {
+    RWY_FIELD,
+        ESB_T_STR,
+        ESB_SCOPE_AIRCRAFT,
+        0u,
+        4u, // 3 Char per runway + 1 for null terminator
+        "AMAN list of runways tracked",
+    }
 };
 
 std::unique_ptr<amanplugin::AMANPlugin> myPluginInstance = nullptr;
@@ -178,6 +187,12 @@ void AMANPlugin::OnTimer(int Counter)
     {
         PublishIAFsToBridge();
         iafUpdateRequired.store(false, std::memory_order_release);
+    }
+
+    if (rwyUpdateRequired.load(std::memory_order_acquire))
+    {
+        PublishRunwaysToBridge();
+        rwyUpdateRequired.store(false, std::memory_order_release);
     }
 
     // populate snapshot map with current flights
@@ -453,6 +468,42 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         return;
     }
 
+    // Parse response since it contains runway assignment requests
+    //TODO:
+    try {
+        auto json = nlohmann::json::parse(res->body);
+        if (json.contains("commands") && json["commands"].is_array()) {
+            std::unordered_map<std::string, RunwayAssign> rwyMap;
+            for (const auto& command : json["commands"]) {
+                if (!command.contains("type") || !command["type"].is_string() || command["type"].get<std::string>() != "RUNWAY_ASSIGN") continue;
+                if (!command.contains("callsign") || !command["callsign"].is_string()) continue;
+                if (!command.contains("runwayId") || !command["runwayId"].is_string()) continue;
+
+                std::string callsign = command["callsign"].get<std::string>();
+                std::string runway = command["runwayId"].get<std::string>();
+                RunwayAssignReason reason = RunwayAssignReason::INVALID;
+                if (command.contains("reason") && command["reason"].is_string()) {
+                    std::string reasonStr = command["reason"].get<std::string>();
+                    if (reasonStr == "sequencer") reason = RunwayAssignReason::SEQUENCER;
+                    else if (reasonStr == "config") reason = RunwayAssignReason::CONFIG;
+                }
+                rwyMap[callsign] = {runway, reason};
+            }
+            if (!rwyMap.empty()) {
+                rwyUpdateRequired.store(true, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(rwyMapMutex_);
+                rwyMap_.clear();
+                rwyMap_ = std::move(rwyMap);
+            }
+        }
+    } catch (const std::exception& e) {
+        if (printError) {
+            printError = false;
+            QueueError("Failed to parse the AMAN API response for ICAO " + icao + ": " + std::string(e.what()));
+        }
+        return;
+    }
+
     printError = true; // Reset error flag on successful response
 }
 
@@ -487,6 +538,11 @@ bool AMANPlugin::RegisterProvider()
         return false;
     }
 
+    if (api_->own_field(provider_, RWY_FIELD, &rwyField_) != ESB_OK) {
+        rwyField_ = ESB_FIELD_NONE;
+        return false;
+    }
+
     return true;
 }
 
@@ -517,6 +573,27 @@ void AMANPlugin::PublishIAFsToBridge()
 
     ESB_Value value = ESB_Str(iafString.c_str());
     api_->set_global(provider_, iafField_, &value);
+}
+
+void AMANPlugin::PublishRunwaysToBridge()
+{
+    if (rwyField_ == ESB_FIELD_NONE) return;
+
+    std::unordered_map<std::string, RunwayAssign> rwyMap;
+    {
+        std::lock_guard<std::mutex> lock(rwyMapMutex_);
+        rwyMap = std::move(rwyMap_);
+        rwyMap_.clear();
+    }
+
+    for (const auto& [callsign, rwyAssign] : rwyMap)
+    {
+        ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
+        if (api_->aircraft(callsign.c_str(), &aircraft) != ESB_OK) continue;
+
+        ESB_Value value = ESB_Str(rwyAssign.runwayId.c_str());
+        api_->set_ac(provider_, aircraft, rwyField_, &value);
+    }
 }
 
 void AMANPlugin::ResolveConsumedFields()

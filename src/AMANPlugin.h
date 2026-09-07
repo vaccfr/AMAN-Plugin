@@ -54,6 +54,19 @@ class AMANPlugin : public CPlugIn
             : callsign(callsign), aircraType(aicraType), departure(departure), runwayId(runwayId), iaf(iaf), iafEta(iafEta), altitude(altitude), verticalSpeed(verticalSpeed), finalAltitude(finalAltitude), groundspeed(groundspeed), latitude(latitude), longitude(longitude) {}
     };
 
+    enum class RunwayAssignReason : int
+    {
+        SEQUENCER = 0, // Assigned by the sequencer
+        INVALID, // Runway is unknown by API
+        CONFIG, // Runway is not active
+    };
+
+    struct RunwayAssign
+    {
+        std::string runwayId;
+        RunwayAssignReason reason;
+    };
+
 public:
     AMANPlugin();
     ~AMANPlugin();
@@ -81,6 +94,7 @@ private:
 
     bool RegisterProvider();
     void PublishIAFsToBridge();
+    void PublishRunwaysToBridge();
 
     /// Resolve the fields we read from CoFrance. Retried from OnTimer until they
     /// land: EuroScope loads plugins in the order the user's settings file lists
@@ -102,10 +116,11 @@ private:
 private:
     // Plugin state
     bool initialized_ = false;
-    bool printError = true;
+    bool printError = true; // Usable only in worker thread
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
     std::atomic<bool> iafUpdateRequired{false};
+    std::atomic<bool> rwyUpdateRequired{false};
 
     // Bridge
     const ESB_Api_v1* api_ = nullptr;
@@ -113,7 +128,8 @@ private:
     bool providerConflict_ = false;   // Another module owns "amanplugin"
     int missingTicks_ = 0;
     bool missingReported_ = false;    // ESB_MISSING_MESSAGE is said once
-    uint32_t iafField_ = 0;          // 0 == still unresolved
+    uint32_t iafField_ = 0;           // 0 == still unresolved
+    uint32_t rwyField_ = 0;           // 0 == still unresolved
 
     // Read from CoFrance, which owns them. eta_iaf is UTC Unix seconds; iaf names
     // the fix that time is over. 0 == still unresolved.
@@ -135,6 +151,9 @@ private:
 
     std::mutex iafMapMutex_;
     std::unordered_map<std::string, std::unordered_set<std::string>> iafMap_; // Map of ICAOs to their IAFs
+
+    std::mutex rwyMapMutex_;
+    std::unordered_map<std::string, RunwayAssign> rwyMap_; // Map of Callsign to their runway assign request
 };
 
 } // namespace amanplugin
