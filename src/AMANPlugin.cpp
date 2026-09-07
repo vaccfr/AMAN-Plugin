@@ -228,6 +228,7 @@ void AMANPlugin::OnTimer(int Counter)
                     callsign,
                     fp.GetFlightPlanData().GetAircraftFPType(),
                     fp.GetFlightPlanData().GetOrigin(),
+                    fp.GetFlightPlanData().GetArrivalRwy(),
                     fix,
                     GetIafEtaFromBridge(callsign, fix),
                     pos.GetFlightLevel(),
@@ -418,6 +419,7 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         flightJson["callsign"] = flight.callsign;
         flightJson["aircraftType"] = flight.aircraType;
         flightJson["departure"] = flight.departure;
+        flightJson["runwayId"] = flight.runwayId;
         flightJson["iaf"] = flight.iaf;
         if (flight.iafEta.empty()) flightJson["eta_iaf_utc"] = nullptr;
         else flightJson["eta_iaf_utc"] = flight.iafEta;

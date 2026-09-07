@@ -40,6 +40,7 @@ class AMANPlugin : public CPlugIn
         std::string callsign;   // required every snapshot
         std::string aircraType;  // required every snapshot
         std::string departure;  // required every snapshot
+        std::string runwayId;   // required every snapshot
         std::string iaf;        // required every snapshot
         std::string iafEta;     // required every snapshot
         int altitude;
@@ -49,8 +50,8 @@ class AMANPlugin : public CPlugIn
         double latitude;
         double longitude;
 
-        Flight(const std::string& callsign, const std::string& aicraType, const std::string& departure, const std::string& iaf, const std::string& iafEta, int altitude = 0, int verticalSpeed = 0, int finalAltitude = 0, int groundspeed = 0, double latitude = 0.0, double longitude = 0.0)
-            : callsign(callsign), aircraType(aicraType), departure(departure), iaf(iaf), iafEta(iafEta), altitude(altitude), verticalSpeed(verticalSpeed), finalAltitude(finalAltitude), groundspeed(groundspeed), latitude(latitude), longitude(longitude) {}
+        Flight(const std::string& callsign, const std::string& aicraType, const std::string& departure, const std::string& runwayId, const std::string& iaf, const std::string& iafEta, int altitude = 0, int verticalSpeed = 0, int finalAltitude = 0, int groundspeed = 0, double latitude = 0.0, double longitude = 0.0)
+            : callsign(callsign), aircraType(aicraType), departure(departure), runwayId(runwayId), iaf(iaf), iafEta(iafEta), altitude(altitude), verticalSpeed(verticalSpeed), finalAltitude(finalAltitude), groundspeed(groundspeed), latitude(latitude), longitude(longitude) {}
     };
 
 public:
