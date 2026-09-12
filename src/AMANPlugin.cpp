@@ -66,8 +66,11 @@ const ESB_FieldDecl FIELDS[] = {
         ESB_T_STR,
         ESB_SCOPE_AIRCRAFT,
         0u,
-        4u, // 3 Char per runway + 1 for null terminator
-        "AMAN list of runways tracked",
+        // "<runway>/<reason>": 3 char runway, separator, one reason letter is 5.
+        // max_bytes caps the payload length, which ESB_Str reports without the
+        // terminator, so this is characters and not sizeof a buffer.
+        8u,
+        "Runway AMAN assigns, as \"<runway>/<reason>\" (S sequencer, C config, I invalid)",
     }
 };
 
@@ -469,7 +472,6 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
     }
 
     // Parse response since it contains runway assignment requests
-    //TODO:
     try {
         auto json = nlohmann::json::parse(res->body);
         if (json.contains("commands") && json["commands"].is_array()) {
@@ -512,7 +514,10 @@ bool AMANPlugin::RegisterProvider()
     ESB_ProviderDecl decl = {};
     decl.struct_size = sizeof decl;
     decl.provider_id = PROVIDER_ID;
-    decl.schema_major = 1;
+    // 2: rwy carries "<runway>/<reason>" where it used to carry the bare runway.
+    // A consumer built against schema 1 would read the separator as part of the
+    // runway, so this is a break rather than an addition.
+    decl.schema_major = 2;
     decl.schema_minor = 0;
     decl.display_name = "AMAN Plugin";
     decl.contact = "https://github.com/vaccfr/AMAN-Plugin";
@@ -591,7 +596,21 @@ void AMANPlugin::PublishRunwaysToBridge()
         ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
         if (api_->aircraft(callsign.c_str(), &aircraft) != ESB_OK) continue;
 
-        ESB_Value value = ESB_Str(rwyAssign.runwayId.c_str());
+        // The reason travels with the runway rather than in a field of its own. A
+        // consumer applies the sequencer's order without asking and puts anything
+        // else to the controller, so reading a new runway against the previous
+        // reason would silently amend a flight plan nobody agreed to - which is
+        // exactly what two fields and two notifications would allow.
+        char reason = 'I';
+        switch (rwyAssign.reason) {
+        case RunwayAssignReason::SEQUENCER: reason = 'S'; break;
+        case RunwayAssignReason::CONFIG:    reason = 'C'; break;
+        default:                            reason = 'I'; break;
+        }
+
+        const std::string payload = rwyAssign.runwayId + "/" + reason;
+
+        ESB_Value value = ESB_Str(payload.c_str());
         api_->set_ac(provider_, aircraft, rwyField_, &value);
     }
 }
