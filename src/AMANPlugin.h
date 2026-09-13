@@ -121,6 +121,7 @@ private:
     std::thread m_thread;
     std::atomic<bool> iafUpdateRequired{false};
     std::atomic<bool> rwyUpdateRequired{false};
+    std::atomic<int> connectionType{CONNECTION_TYPE_NO};
 
     // Bridge
     const ESB_Api_v1* api_ = nullptr;

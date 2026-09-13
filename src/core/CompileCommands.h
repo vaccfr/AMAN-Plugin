@@ -139,6 +139,12 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
     }
     else if (TryToParseICAOs(icaoList, line, compatibleICAOs))
     {
+        if (connectionType.load(std::memory_order::acquire) != CONNECTION_TYPE_DIRECT
+        && connectionType.load(std::memory_order::acquire) != CONNECTION_TYPE_SWEATBOX)
+        {
+            DisplayError("Cannot update tracked ICAOs: Not connected to network.");
+            return true;
+        }
         // User provided ICAOs list or Position: example: .aman LFPG LFPO
         std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
         trackedICAOs_ = std::move(icaoList);

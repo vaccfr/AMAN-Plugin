@@ -175,6 +175,10 @@ void AMANPlugin::OnTimer(int Counter)
     if (cofranceEtaField_ == 0 || cofranceIafField_ == 0) ResolveConsumedFields();
 
 
+    // Update connection Type
+    connectionType.store(this->GetConnectionType(), std::memory_order_release);
+
+
     {
         // Drain message queue
         std::lock_guard<std::mutex> lock(messageQueueMutex_);
@@ -431,8 +435,12 @@ void AMANPlugin::RefreshConfig(httplib::Client& cli)
 
 void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& icao)
 {
+    int type = connectionType.load(std::memory_order_acquire);
+    if (type != CONNECTION_TYPE_DIRECT && type != CONNECTION_TYPE_SWEATBOX) return;
+
     nlohmann::json body;
     body["type"] = "SNAPSHOT";
+    body["network"] = (type == CONNECTION_TYPE_SWEATBOX ? "sweatbox" : "live");
     body["flights"] = nlohmann::json::array();
 
     std::vector<Flight> flights;
@@ -468,9 +476,9 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         body["flights"].push_back(flightJson);
     }
 
-
+    std::string endpoint = std::string(type == CONNECTION_TYPE_SWEATBOX ? "/sweatbox" : "") + "/api/" + icao + "/feed";
     httplib::Headers headers = { {"User-Agent", "AMANplugin"}, {"Content-Type", "application/json"}, {"Authorization", "Bearer " + AUTH_SECRET}, {"X-Timestamp", std::to_string(std::time(nullptr))} };
-    auto res = cli.Post("/api/" + icao + "/feed", headers, body.dump(), "application/json");
+    auto res = cli.Post(endpoint, headers, body.dump(), "application/json");
 
     if (!res) {
         if (printError) {
