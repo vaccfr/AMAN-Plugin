@@ -325,7 +325,17 @@ void AMANPlugin::GetCompatibleICAOs(httplib::Client& cli)
         return;
     }
 
+
+
     if (res->status != 200) {
+        if (res->status == 401) {
+            if (printError) {
+                printError = false;
+                QueueError("Invalid Authorization key, make sure you are using latest plugin version.");
+            }
+            return;
+        }
+
         if (printError) {
             printError = false;
             QueueError("Unexpected response from the AMAN API server: " + std::to_string(res->status));
@@ -367,6 +377,13 @@ void AMANPlugin::GetIAFsForICAO(httplib::Client& cli, const std::string& icao)
     }
 
     if (res->status != 200 && res->status != 202) {
+        if (res->status == 401) {
+            if (printError) {
+                printError = false;
+                QueueError("Invalid Authorization key, make sure you are using latest plugin version.");
+            }
+            return;
+        }
         if (printError) {
             printError = false;
             QueueError("Unexpected response from the AMAN API server for ICAO " + icao + ": " + std::to_string(res->status));
@@ -464,6 +481,13 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
     }
 
     if (res->status != 200 && res->status != 202) {
+        if (res->status == 401) {
+            if (printError) {
+                printError = false;
+                QueueError("Invalid Authorization key, make sure you are using latest plugin version.");
+            }
+            return;
+        }
         if (printError) {
             printError = false;
             QueueError("Unexpected response from the AMAN API server for ICAO " + icao + ": " + std::to_string(res->status));
