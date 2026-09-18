@@ -11,9 +11,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include <utility>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <EuroScopePlugIn.h>
@@ -61,10 +63,17 @@ class AMANPlugin : public CPlugIn
         CONFIG, // Runway is not active
     };
 
+    /// One RUNWAY_ASSIGN from the runway poll. callsign, runwayId and since
+    /// together identify a single sequencer decision: the server repeats it on
+    /// every poll until the feed reports the new runway or it expires.
     struct RunwayAssign
     {
+        std::string callsign;
+        std::string arrivalIcao;  // The flight's destination, not the sequencing airport
         std::string runwayId;
+        std::string since;        // Kept verbatim, only ever compared
         RunwayAssignReason reason;
+        std::chrono::steady_clock::time_point expiresAt; // The server's expiresAt, on the local clock
     };
 
 public:
@@ -91,9 +100,14 @@ private:
     void GetIAFsForICAO(httplib::Client& cli, const std::string& icao);
     void RefreshConfig(httplib::Client& cli);
     void PostSnapshotsToAPI(httplib::Client& cli, const std::string& icao);
+    void PollRunwayAssignRequests(httplib::Client& cli);
 
     bool RegisterProvider();
     void PublishIAFsToBridge();
+
+    /// Write every cached runway command this controller may act on and has not
+    /// written yet. Runs every tick, so one that could not be written earlier -
+    /// flight not ours yet, bridge not ready - is retried until it expires.
     void PublishRunwaysToBridge();
 
     /// Resolve the fields we read from CoFrance. Retried from OnTimer until they
@@ -117,11 +131,12 @@ private:
     // Plugin state
     bool initialized_ = false;
     bool printError = true; // Usable only in worker thread
+    bool printRwyError = true; // Same, for the runway poll alone
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
     std::atomic<bool> iafUpdateRequired{false};
-    std::atomic<bool> rwyUpdateRequired{false};
     std::atomic<int> connectionType{CONNECTION_TYPE_NO};
+    std::atomic<bool> isController{false};
 
     // Bridge
     const ESB_Api_v1* api_ = nullptr;
@@ -153,8 +168,16 @@ private:
     std::mutex iafMapMutex_;
     std::unordered_map<std::string, std::unordered_set<std::string>> iafMap_; // Map of ICAOs to their IAFs
 
-    std::mutex rwyMapMutex_;
-    std::unordered_map<std::string, RunwayAssign> rwyMap_; // Map of Callsign to their runway assign request
+    // Runway commands. The worker replaces the whole set on every 200 from the
+    // poll and keeps it on a 304; OnTimer writes from it.
+    std::mutex rwyCommandsMutex_;
+    std::vector<RunwayAssign> rwyCommands_;   // Exactly the set rwyEtag_ describes
+    std::string rwyEtag_;                     // Worker thread only
+    int rwyEtagNetwork_ = CONNECTION_TYPE_NO; // Worker thread only: the endpoint rwyEtag_ came from
+
+    // Main thread only: "<callsign>|<runway>|<since>" of every command written,
+    // kept until a while after it expires.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> rwyWritten_;
 };
 
 } // namespace amanplugin

@@ -3,8 +3,10 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 
@@ -51,6 +53,64 @@ static std::string FormatUtcHms(int64_t epochSeconds)
     if (written <= 0) return {};
     return std::string(buf, static_cast<size_t>(written));
 }
+
+/// Parse the runway API's timestamps - "2026-09-18T14:32:07.310Z", fraction
+/// optional - into UTC milliseconds since the epoch. False on anything else
+/// rather than a guess: a wrong expiry is worse than a skipped command.
+static bool ParseIsoUtcMs(const std::string& text, int64_t& outMs)
+{
+    if (text.size() < 20 || text[4] != '-' || text[7] != '-' || text[10] != 'T'
+        || text[13] != ':' || text[16] != ':')
+        return false;
+
+    const auto number = [&text](size_t pos, size_t width, int& out) {
+        out = 0;
+        for (size_t i = pos; i < pos + width; ++i) {
+            if (text[i] < '0' || text[i] > '9') return false;
+            out = out * 10 + (text[i] - '0');
+        }
+        return true;
+    };
+
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    if (!number(0, 4, year) || !number(5, 2, month) || !number(8, 2, day)
+        || !number(11, 2, hour) || !number(14, 2, minute) || !number(17, 2, second))
+        return false;
+
+    // Any number of fraction digits; milliseconds are kept.
+    size_t pos = 19;
+    int millis = 0;
+    if (text[pos] == '.') {
+        const size_t first = ++pos;
+        for (int scale = 100; pos < text.size() && text[pos] >= '0' && text[pos] <= '9'; ++pos, scale /= 10)
+            millis += (text[pos] - '0') * scale;
+        if (pos == first) return false;
+    }
+    if (pos + 1 != text.size() || text[pos] != 'Z') return false;
+
+    const std::chrono::year_month_day date{std::chrono::year{year},
+                                           std::chrono::month{static_cast<unsigned>(month)},
+                                           std::chrono::day{static_cast<unsigned>(day)}};
+    if (!date.ok() || hour > 23 || minute > 59 || second > 60) return false;
+
+    const auto days = std::chrono::sys_days{date}.time_since_epoch();
+    outMs = std::chrono::duration_cast<std::chrono::milliseconds>(days).count()
+          + ((hour * 60LL + minute) * 60 + second) * 1000 + millis;
+    return true;
+}
+
+/// @p key of @p object when it is a string, else empty. Absent, null and
+/// mistyped all read the same, which is what every caller wants.
+static std::string StringField(const nlohmann::json& object, const char* key)
+{
+    const auto it = object.find(key);
+    return (it != object.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+
+/// How long a written runway is remembered past its command's expiry. Only a
+/// repeat of that very decision is suppressed, so being generous costs nothing,
+/// and it covers expiry being worked out from a whole-second serverTime.
+static constexpr auto RWY_WRITTEN_GRACE = std::chrono::seconds(60);
 
 const ESB_FieldDecl FIELDS[] = {
     {
@@ -176,7 +236,13 @@ void AMANPlugin::OnTimer(int Counter)
 
 
     // Update connection Type
-    connectionType.store(this->GetConnectionType(), std::memory_order_release);
+    const int type = GetConnectionType();
+    connectionType.store(type, std::memory_order_release);
+
+    // Only a controller the servers accept may amend flight plans, and there is
+    // no such thing offline or in a sim session.
+    const bool connected = type == CONNECTION_TYPE_DIRECT || type == CONNECTION_TYPE_SWEATBOX;
+    isController.store(connected && ControllerMyself().IsController(), std::memory_order_release);
 
 
     {
@@ -196,11 +262,9 @@ void AMANPlugin::OnTimer(int Counter)
         iafUpdateRequired.store(false, std::memory_order_release);
     }
 
-    if (rwyUpdateRequired.load(std::memory_order_acquire))
-    {
-        PublishRunwaysToBridge();
-        rwyUpdateRequired.store(false, std::memory_order_release);
-    }
+    // Every tick rather than on a flag: a command that could not be written yet
+    // stays cached, and this is where it is retried.
+    PublishRunwaysToBridge();
 
     // populate snapshot map with current flights
     if (Counter % PERIODIC_POST_TIME_INTERVAL == 0 )
@@ -300,9 +364,19 @@ void AMANPlugin::WorkerThread()
 
         if (counter % PERIODIC_POST_TIME_INTERVAL == 0)
         {
-            for (const auto& icao : trackedICAOs_)
+            std::unordered_set<std::string> trackedIcaos;
+            {
+                std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
+                trackedIcaos = trackedICAOs_;
+            }
+            for (const auto& icao : trackedIcaos)
             {
                 PostSnapshotsToAPI(*cli, icao);
+            }
+
+            if (isController.load(std::memory_order_acquire) == true) {
+                // Only controllers can assign runways
+                PollRunwayAssignRequests(*cli);
             }
         }
 
@@ -503,42 +577,106 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         return;
     }
 
-    // Parse response since it contains runway assignment requests
-    try {
-        auto json = nlohmann::json::parse(res->body);
-        if (json.contains("commands") && json["commands"].is_array()) {
-            std::unordered_map<std::string, RunwayAssign> rwyMap;
-            for (const auto& command : json["commands"]) {
-                if (!command.contains("type") || !command["type"].is_string() || command["type"].get<std::string>() != "RUNWAY_ASSIGN") continue;
-                if (!command.contains("callsign") || !command["callsign"].is_string()) continue;
-                if (!command.contains("runwayId") || !command["runwayId"].is_string()) continue;
+    printError = true; // Reset error flag on successful response
+}
 
-                std::string callsign = command["callsign"].get<std::string>();
-                std::string runway = command["runwayId"].get<std::string>();
-                RunwayAssignReason reason = RunwayAssignReason::INVALID;
-                if (command.contains("reason") && command["reason"].is_string()) {
-                    std::string reasonStr = command["reason"].get<std::string>();
-                    if (reasonStr == "sequencer") reason = RunwayAssignReason::SEQUENCER;
-                    else if (reasonStr == "config") reason = RunwayAssignReason::CONFIG;
-                }
-                rwyMap[callsign] = {runway, reason};
-            }
-            if (!rwyMap.empty()) {
-                rwyUpdateRequired.store(true, std::memory_order_release);
-                std::lock_guard<std::mutex> lock(rwyMapMutex_);
-                rwyMap_.clear();
-                rwyMap_ = std::move(rwyMap);
-            }
-        }
-    } catch (const std::exception& e) {
-        if (printError) {
-            printError = false;
-            QueueError("Failed to parse the AMAN API response for ICAO " + icao + ": " + std::string(e.what()));
+void AMANPlugin::PollRunwayAssignRequests(httplib::Client& cli)
+{
+    const int type = connectionType.load(std::memory_order_acquire);
+    if (type != CONNECTION_TYPE_DIRECT && type != CONNECTION_TYPE_SWEATBOX) return;
+
+    // Live and sweatbox are separate endpoints. A tag from one says nothing about
+    // the other, and neither do the commands it was vouching for.
+    if (type != rwyEtagNetwork_) {
+        rwyEtagNetwork_ = type;
+        rwyEtag_.clear();
+        std::lock_guard<std::mutex> lock(rwyCommandsMutex_);
+        rwyCommands_.clear();
+    }
+
+    const std::string endpoint = std::string(type == CONNECTION_TYPE_SWEATBOX ? "/sweatbox" : "") + "/api/runways";
+    httplib::Headers headers = { {"User-Agent", "AMANplugin"} };
+    if (!rwyEtag_.empty()) headers.emplace("If-None-Match", rwyEtag_);
+
+    auto res = cli.Get(endpoint, headers);
+
+    // printRwyError rather than printError: PostSnapshotsToAPI resets the shared
+    // flag after every successful feed, which would re-raise a poll that keeps
+    // failing every five seconds.
+    if (!res) {
+        if (printRwyError) {
+            printRwyError = false;
+            QueueError("Cannot reach the AMAN API server for runways: " + httplib::to_string(res.error()));
         }
         return;
     }
 
-    printError = true; // Reset error flag on successful response
+    // Unchanged since the last 200, so the cached set is still exactly the
+    // server's. Whatever in it has not been written yet, OnTimer keeps retrying.
+    if (res->status == 304) {
+        printRwyError = true;
+        return;
+    }
+
+    if (res->status != 200) {
+        if (printRwyError) {
+            printRwyError = false;
+            QueueError("Unexpected response from the AMAN API server for runways: " + std::to_string(res->status));
+        }
+        return;
+    }
+
+    const auto received = std::chrono::steady_clock::now();
+    std::vector<RunwayAssign> commands;
+    try {
+        const auto json = nlohmann::json::parse(res->body);
+        const auto& list = json.at("commands");
+        if (!list.is_array()) throw std::runtime_error("\"commands\" is not an array");
+
+        // Expiry is carried over as the time left by the server's own clock, so a
+        // controller's PC clock being off does not matter. Only needed when there
+        // is something to expire.
+        int64_t serverTimeMs = 0;
+        if (!list.empty() && !ParseIsoUtcMs(StringField(json, "serverTime"), serverTimeMs))
+            throw std::runtime_error("missing or malformed \"serverTime\"");
+
+        for (const auto& command : list) {
+            if (StringField(command, "type") != "RUNWAY_ASSIGN") continue;
+
+            RunwayAssign assign;
+            assign.callsign = StringField(command, "callsign");
+            assign.arrivalIcao = StringField(command, "arrivalIcao");
+            assign.runwayId = StringField(command, "runwayId");
+            assign.since = StringField(command, "since");
+            if (assign.callsign.empty() || assign.arrivalIcao.empty() || assign.runwayId.empty() || assign.since.empty()) continue;
+
+            int64_t expiresAtMs = 0;
+            if (!ParseIsoUtcMs(StringField(command, "expiresAt"), expiresAtMs) || expiresAtMs <= serverTimeMs) continue;
+            assign.expiresAt = received + std::chrono::milliseconds(expiresAtMs - serverTimeMs);
+
+            const std::string reason = StringField(command, "reason");
+            if (reason == "sequencer") assign.reason = RunwayAssignReason::SEQUENCER;
+            else if (reason == "config") assign.reason = RunwayAssignReason::CONFIG;
+            else assign.reason = RunwayAssignReason::INVALID;
+
+            commands.push_back(std::move(assign));
+        }
+    } catch (const std::exception& e) {
+        if (printRwyError) {
+            printRwyError = false;
+            QueueError("Failed to parse the AMAN API response for runways: " + std::string(e.what()));
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(rwyCommandsMutex_);
+        rwyCommands_ = std::move(commands);
+    }
+    // Only once the set is in place: the tag must never vouch for anything but
+    // what is cached, or a 304 would confirm commands this plugin never saw.
+    rwyEtag_ = res->get_header_value("ETag");
+    printRwyError = true;
 }
 
 bool AMANPlugin::RegisterProvider()
@@ -614,19 +752,45 @@ void AMANPlugin::PublishIAFsToBridge()
 
 void AMANPlugin::PublishRunwaysToBridge()
 {
-    if (rwyField_ == ESB_FIELD_NONE) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(rwyWritten_, [&now](const auto& written) { return written.second <= now; });
 
-    std::unordered_map<std::string, RunwayAssign> rwyMap;
+    if (rwyField_ == ESB_FIELD_NONE || !isController.load(std::memory_order_acquire)) return;
+
+    std::vector<RunwayAssign> commands;
     {
-        std::lock_guard<std::mutex> lock(rwyMapMutex_);
-        rwyMap = std::move(rwyMap_);
-        rwyMap_.clear();
+        std::lock_guard<std::mutex> lock(rwyCommandsMutex_);
+        commands = rwyCommands_;
     }
 
-    for (const auto& [callsign, rwyAssign] : rwyMap)
+    for (const auto& command : commands)
     {
+        if (command.expiresAt <= now) continue;
+
+        // The server repeats a decision until the feed catches up with it, so one
+        // already written is skipped rather than written again: a controller who
+        // turned a config change down would otherwise be asked on every tick.
+        std::string key = command.callsign + "|" + command.runwayId + "|" + command.since;
+        if (rwyWritten_.contains(key)) continue;
+
+        // Deliberately not limited to the flights in our own snapshot: only the
+        // controller feeding the sequencer tracks airports, and every controller
+        // applies runways to the flights they own. So: the airport the command was
+        // decided for, and only while this controller could amend the flight.
+        // Anything else stays cached and is looked at again next tick, which is
+        // how a flight handed over to us gets its runway.
+        CFlightPlan fp = FlightPlanSelect(command.callsign.c_str());
+        if (!fp.IsValid()) continue;
+
+        std::string destination = fp.GetFlightPlanData().GetDestination();
+        std::transform(destination.begin(), destination.end(), destination.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (destination != command.arrivalIcao) continue;
+
+        const char* tracker = fp.GetTrackingControllerId();
+        if (!fp.GetTrackingControllerIsMe() && tracker != nullptr && tracker[0] != '\0') continue;
+
         ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
-        if (api_->aircraft(callsign.c_str(), &aircraft) != ESB_OK) continue;
+        if (api_->aircraft(command.callsign.c_str(), &aircraft) != ESB_OK) continue;
 
         // The reason travels with the runway rather than in a field of its own. A
         // consumer applies the sequencer's order without asking and puts anything
@@ -634,16 +798,19 @@ void AMANPlugin::PublishRunwaysToBridge()
         // reason would silently amend a flight plan nobody agreed to - which is
         // exactly what two fields and two notifications would allow.
         char reason = 'I';
-        switch (rwyAssign.reason) {
+        switch (command.reason) {
         case RunwayAssignReason::SEQUENCER: reason = 'S'; break;
         case RunwayAssignReason::CONFIG:    reason = 'C'; break;
         default:                            reason = 'I'; break;
         }
 
-        const std::string payload = rwyAssign.runwayId + "/" + reason;
+        const std::string payload = command.runwayId + "/" + reason;
 
         ESB_Value value = ESB_Str(payload.c_str());
-        api_->set_ac(provider_, aircraft, rwyField_, &value);
+        if (api_->set_ac(provider_, aircraft, rwyField_, &value) != ESB_OK) continue;
+
+        // Recorded only once the bridge took it; a failed write is retried.
+        rwyWritten_.emplace(std::move(key), command.expiresAt + RWY_WRITTEN_GRACE);
     }
 }
 
