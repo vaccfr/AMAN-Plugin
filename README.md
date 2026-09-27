@@ -200,6 +200,27 @@ one being reported would be a confident wrong number, so a mismatch yields `null
 An unset value is the ordinary case, not an error: CoFrance clears both fields as soon
 as a flight passes its IAF or is vectored off the route it was predicted along.
 
+### EAT exchange
+
+| Field | Type | Scope | Direction | Description |
+|---|---|---|---|---|
+| `amanplugin/eat` | `STR` | Aircraft | Published | `A<HHMM>/<since>` to assign, `D/<since>` to delete |
+| `cofrance/eat` | `STR` | Aircraft | Consumed | EAT CoFrance holds: `HHMM`, or `NONE` |
+
+The API is the sync layer for EATs between clients. Every connected instance,
+controller or observer, polls `GET /api/eats` (no token, `ETag`/`If-None-Match`,
+every 5 s) and relays each `(callsign, type, since)` **once** onto the bridge, for
+every aircraft in the response that it can see. Each CoFrance then updates its own
+copy; there is no scratchpad sync. A command for an aircraft not yet in sight stays
+cached until it is. EAT commands never expire; a callsign's records are forgotten
+once it drops out of the response. The `since` travels on the bridge so CoFrance can
+tell a deliberate re-send of the same EAT from a repeat, and CoFrance reads what is
+already on the bridge when it starts or first sees an aircraft.
+
+The feeder reports `cofrance/eat` in each snapshot flight's `eat`: the value when
+CoFrance holds one, `null` on `NONE`, and the field omitted whenever CoFrance has not
+said (unset, not loaded, unparseable). Polling never starts feeding.
+
 ---
 
 ## Backend API

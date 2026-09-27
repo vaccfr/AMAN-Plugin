@@ -27,11 +27,21 @@ using namespace EuroScopePlugIn;
 static constexpr const char* PROVIDER_ID = "amanplugin";
 static constexpr const char* RWY_FIELD = "rwy";
 static constexpr const char* IAF_FIELD = "iaf";
+static constexpr const char* EAT_FIELD = "eat";
 
 /// CoFrance owns these. It integrates a wind-aware trajectory per flight, which
 /// this plugin does not, so the ETA over an IAF is read rather than computed.
 static constexpr const char* COFRANCE_ETA_IAF = "cofrance/eta_iaf";
 static constexpr const char* COFRANCE_IAF = "cofrance/iaf";
+
+/// The EAT CoFrance holds, "HHMM", or this when it holds none. Unset means
+/// CoFrance cannot tell, which is a different answer altogether.
+static constexpr const char* COFRANCE_EAT = "cofrance/eat";
+static constexpr const char* COFRANCE_EAT_NONE = "NONE";
+
+/// amanplugin/eat is "A<HHMM>/<since>" or "D/<since>". A since longer than this
+/// would not fit the field's cap, and the API's are 24 characters.
+static constexpr size_t MAX_EAT_SINCE = 40;
 
 /// The bridge is declared missing only after it has had a fair chance to load.
 static constexpr int MISSING_TICKS_BEFORE_NOTICE = 10;
@@ -107,6 +117,18 @@ static std::string StringField(const nlohmann::json& object, const char* key)
     return (it != object.end() && it->is_string()) ? it->get<std::string>() : std::string();
 }
 
+/// "HHMM", four digits making a real UTC time of day. Anything else is neither
+/// written to CoFrance nor reported back from it.
+static bool IsValidHhmm(const std::string& text)
+{
+    if (text.size() != 4) return false;
+    for (const char c : text) {
+        if (c < '0' || c > '9') return false;
+    }
+    return (text[0] - '0') * 10 + (text[1] - '0') < 24
+        && (text[2] - '0') * 10 + (text[3] - '0') < 60;
+}
+
 /// How long a written runway is remembered past its command's expiry. Only a
 /// repeat of that very decision is suppressed, so being generous costs nothing,
 /// and it covers expiry being worked out from a whole-second serverTime.
@@ -131,6 +153,17 @@ const ESB_FieldDecl FIELDS[] = {
         // terminator, so this is characters and not sizeof a buffer.
         8u,
         "Runway AMAN assigns, as \"<runway>/<reason>\" (S sequencer, C config, I invalid)",
+    },
+    {
+        EAT_FIELD,
+        ESB_T_STR,
+        ESB_SCOPE_AIRCRAFT,
+        0u,
+        // "A" + HHMM + "/" + since. The since travels with the EAT because it is the
+        // command's identity: the sequencer re-sends the same EAT under a new one
+        // when it wants it pushed again, and CoFrance must tell that from a repeat.
+        48u,
+        "EAT command, as \"A<HHMM>/<since>\" to assign or \"D/<since>\" to delete",
     }
 };
 
@@ -232,7 +265,8 @@ void AMANPlugin::OnTimer(int Counter)
 
     if (provider_ == nullptr && !providerConflict_) RegisterProvider();
 
-    if (cofranceEtaField_ == 0 || cofranceIafField_ == 0) ResolveConsumedFields();
+    if (cofranceEtaField_ == 0 || cofranceIafField_ == 0 || cofranceEatField_ == 0) ResolveConsumedFields();
+
 
 
     // Update connection Type
@@ -265,6 +299,7 @@ void AMANPlugin::OnTimer(int Counter)
     // Every tick rather than on a flag: a command that could not be written yet
     // stays cached, and this is where it is retried.
     PublishRunwaysToBridge();
+    PublishEatsToBridge();
 
     // populate snapshot map with current flights
     if (Counter % PERIODIC_POST_TIME_INTERVAL == 0 )
@@ -310,7 +345,7 @@ void AMANPlugin::OnTimer(int Counter)
                 std::string fix = route.GetPointName(i);
                 if (iafsForDest->second.contains(fix) == false) continue;
 
-                flightsMap[destIcao].emplace_back(
+                auto& flight = flightsMap[destIcao].emplace_back(
                     callsign,
                     fp.GetFlightPlanData().GetAircraftFPType(),
                     fp.GetFlightPlanData().GetOrigin(),
@@ -324,6 +359,7 @@ void AMANPlugin::OnTimer(int Counter)
                     pos.GetPosition().m_Latitude,
                     pos.GetPosition().m_Longitude
                 );
+                flight.eat = GetEatFromBridge(callsign);
                 break;   // first IAF found scanning back from the destination
             }
         }
@@ -378,6 +414,10 @@ void AMANPlugin::WorkerThread()
                 // Only controllers can assign runways
                 PollRunwayAssignRequests(*cli);
             }
+
+            // Every connected instance, controller or not: the API is what keeps every
+            // CoFrance's EATs in step. Polling has nothing to do with feeding either.
+            PollEatCommands(*cli);
         }
 
         if (counter % CONFIG_REFRESH_INTERVAL == 1)
@@ -547,6 +587,13 @@ void AMANPlugin::PostSnapshotsToAPI(httplib::Client& cli, const std::string& ica
         flightJson["lat"] = flight.latitude;
         flightJson["lon"] = flight.longitude;
 
+        // Omitted when we cannot tell: only null completes a deletion, and only a
+        // matching value acquits an EAT, so a guess either way would be a lie.
+        if (flight.eat.has_value()) {
+            if (flight.eat->empty()) flightJson["eat"] = nullptr;
+            else flightJson["eat"] = *flight.eat;
+        }
+
         body["flights"].push_back(flightJson);
     }
 
@@ -679,6 +726,94 @@ void AMANPlugin::PollRunwayAssignRequests(httplib::Client& cli)
     printRwyError = true;
 }
 
+void AMANPlugin::PollEatCommands(httplib::Client& cli)
+{
+    const int type = connectionType.load(std::memory_order_acquire);
+    if (type != CONNECTION_TYPE_DIRECT && type != CONNECTION_TYPE_SWEATBOX) return;
+
+    // Live and sweatbox are separate endpoints, as for runways.
+    if (type != eatEtagNetwork_) {
+        eatEtagNetwork_ = type;
+        eatEtag_.clear();
+        std::lock_guard<std::mutex> lock(eatCommandsMutex_);
+        eatCommands_.clear();
+    }
+
+    // No Authorization header: the feed token is a write credential, and this
+    // endpoint is public.
+    const std::string endpoint = std::string(type == CONNECTION_TYPE_SWEATBOX ? "/sweatbox" : "") + "/api/eats";
+    httplib::Headers headers = { {"User-Agent", "AMANplugin"} };
+    if (!eatEtag_.empty()) headers.emplace("If-None-Match", eatEtag_);
+
+    auto res = cli.Get(endpoint, headers);
+
+    if (!res) {
+        if (printEatError) {
+            printEatError = false;
+            QueueError("Cannot reach the AMAN API server for EATs: " + httplib::to_string(res.error()));
+        }
+        return;
+    }
+
+    if (res->status == 304) {
+        printEatError = true;
+        return;
+    }
+
+    if (res->status != 200) {
+        if (printEatError) {
+            printEatError = false;
+            QueueError("Unexpected response from the AMAN API server for EATs: " + std::to_string(res->status));
+        }
+        return;
+    }
+
+    std::vector<EatCommand> commands;
+    try {
+        const auto json = nlohmann::json::parse(res->body);
+        const auto& list = json.at("commands");
+        if (!list.is_array()) throw std::runtime_error("\"commands\" is not an array");
+
+        // Deliberately no serverTime and no expiresAt, unlike the runway parser:
+        // EAT commands never expire, and none is ever dropped for its age.
+        for (const auto& command : list) {
+            const std::string commandType = StringField(command, "type");
+
+            EatCommand eat;
+            if (commandType == "EAT_ASSIGN") eat.isDelete = false;
+            else if (commandType == "EAT_DELETE") eat.isDelete = true;
+            else continue;   // Any other type is not ours to interpret
+
+            eat.callsign = StringField(command, "callsign");
+            eat.arrivalIcao = StringField(command, "arrivalIcao");
+            eat.since = StringField(command, "since");
+            if (eat.callsign.empty() || eat.arrivalIcao.empty() || eat.since.empty()) continue;
+            if (eat.since.size() > MAX_EAT_SINCE || eat.since.find('/') != std::string::npos) continue;
+
+            if (!eat.isDelete) {
+                eat.eat = StringField(command, "eat");
+                if (!IsValidHhmm(eat.eat)) continue;
+            }
+
+            commands.push_back(std::move(eat));
+        }
+    } catch (const std::exception& e) {
+        if (printEatError) {
+            printEatError = false;
+            QueueError("Failed to parse the AMAN API response for EATs: " + std::string(e.what()));
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(eatCommandsMutex_);
+        eatCommands_ = std::move(commands);
+    }
+    // Only once the set is in place, for the same reason as the runway tag.
+    eatEtag_ = res->get_header_value("ETag");
+    printEatError = true;
+}
+
 bool AMANPlugin::RegisterProvider()
 {
     ESB_ProviderDecl decl = {};
@@ -688,7 +823,7 @@ bool AMANPlugin::RegisterProvider()
     // A consumer built against schema 1 would read the separator as part of the
     // runway, so this is a break rather than an addition.
     decl.schema_major = 2;
-    decl.schema_minor = 0;
+    decl.schema_minor = 1;   // additive: eat
     decl.display_name = "AMAN Plugin";
     decl.contact = "https://github.com/vaccfr/AMAN-Plugin";
     decl.fields = FIELDS;
@@ -715,6 +850,11 @@ bool AMANPlugin::RegisterProvider()
 
     if (api_->own_field(provider_, RWY_FIELD, &rwyField_) != ESB_OK) {
         rwyField_ = ESB_FIELD_NONE;
+        return false;
+    }
+
+    if (api_->own_field(provider_, EAT_FIELD, &eatField_) != ESB_OK) {
+        eatField_ = ESB_FIELD_NONE;
         return false;
     }
 
@@ -814,6 +954,60 @@ void AMANPlugin::PublishRunwaysToBridge()
     }
 }
 
+void AMANPlugin::PublishEatsToBridge()
+{
+    std::vector<EatCommand> commands;
+    {
+        std::lock_guard<std::mutex> lock(eatCommandsMutex_);
+        commands = eatCommands_;
+    }
+
+    // Records are forgotten once their callsign stops appearing, and only then:
+    // there is no expiry to go by, and a command must never be relayed twice while
+    // it stands.
+    std::unordered_set<std::string> listed;
+    for (const auto& command : commands) listed.insert(command.callsign);
+    std::erase_if(eatWritten_, [&listed](const auto& written) { return !listed.contains(written.first); });
+
+    // "Can you write its EAT into CoFrance?" - not before CoFrance is there. It reads
+    // what is already on the bridge when it starts listening, so there is no need to
+    // wait for its subscription as well.
+    if (provider_ == nullptr || eatField_ == ESB_FIELD_NONE || cofranceEatField_ == 0) return;
+
+    for (const auto& command : commands)
+    {
+        const std::string key = std::string(command.isDelete ? "D" : "A") + "|" + command.since;
+        const auto written = eatWritten_.find(command.callsign);
+        if (written != eatWritten_.end() && written->second.contains(key)) continue;
+
+        // Do we have this aircraft, for the airport it was sequenced into?
+        CFlightPlan fp = FlightPlanSelect(command.callsign.c_str());
+        if (!fp.IsValid()) continue;
+
+        std::string destination = fp.GetFlightPlanData().GetDestination();
+        std::transform(destination.begin(), destination.end(), destination.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (destination != command.arrivalIcao) continue;
+
+        // Whoever tracks it: every CoFrance keeps its own copy of every EAT, and this
+        // is how it gets one.
+
+        ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
+        if (api_->aircraft(command.callsign.c_str(), &aircraft) != ESB_OK) continue;
+
+        // The since goes along as the command's identity, so CoFrance applies a
+        // deliberate re-send of the same EAT and ignores a mere repeat.
+        const std::string payload = command.isDelete
+            ? "D/" + command.since
+            : "A" + command.eat + "/" + command.since;
+
+        ESB_Value value = ESB_Str(payload.c_str());
+        if (api_->set_ac(provider_, aircraft, eatField_, &value) != ESB_OK) continue;
+
+        // Recorded only once the bridge took it; a failed write is retried.
+        eatWritten_[command.callsign].insert(key);
+    }
+}
+
 void AMANPlugin::ResolveConsumedFields()
 {
     if (api_ == nullptr) return;
@@ -825,6 +1019,32 @@ void AMANPlugin::ResolveConsumedFields()
         api_->resolve(COFRANCE_ETA_IAF, ESB_T_I64, &cofranceEtaField_);
     if (cofranceIafField_ == 0)
         api_->resolve(COFRANCE_IAF, ESB_T_STR, &cofranceIafField_);
+    // E_NO_FIELD from a CoFrance too old to publish it: EATs are then neither
+    // relayed nor reported, which is the honest answer.
+    if (cofranceEatField_ == 0)
+        api_->resolve(COFRANCE_EAT, ESB_T_STR, &cofranceEatField_);
+}
+
+std::optional<std::string> AMANPlugin::GetEatFromBridge(const std::string& callsign) const
+{
+    if (api_ == nullptr || callsign.empty() || cofranceEatField_ == ESB_FIELD_NONE) return std::nullopt;
+
+    ESB_Aircraft aircraft = ESB_AIRCRAFT_NONE;
+    if (api_->aircraft(callsign.c_str(), &aircraft) != ESB_OK) return std::nullopt;
+
+    char buf[VALUE_BUFFER];
+    ESB_Value value = {};
+    uint32_t bytes = sizeof buf;
+
+    // ESB_E_UNSET: CoFrance has never said anything about this flight's EAT, which
+    // is "cannot tell" and not "none".
+    if (api_->get_ac(aircraft, cofranceEatField_, &value, buf, &bytes) != ESB_OK) return std::nullopt;
+    if (value.type != ESB_T_STR) return std::nullopt;
+
+    const std::string eat(buf, (std::min)(value.bytes, static_cast<uint32_t>(sizeof buf)));
+    if (eat == COFRANCE_EAT_NONE) return std::string();
+    if (!IsValidHhmm(eat)) return std::nullopt;
+    return eat;
 }
 
 std::string AMANPlugin::GetIafEtaFromBridge(const std::string& callsign,
