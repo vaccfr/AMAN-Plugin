@@ -307,7 +307,7 @@ void AMANPlugin::OnTimer(int Counter)
         std::unordered_set<std::string> trackedIcao;
         {
             std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
-            trackedIcao = trackedICAOs_;
+            trackedIcao = std::move(trackedICAOs_);
         }
 
         if (trackedIcao.empty()) return;
@@ -864,12 +864,23 @@ bool AMANPlugin::RegisterProvider()
 void AMANPlugin::PublishIAFsToBridge()
 {
     if (iafField_ == ESB_FIELD_NONE) return;
+
+    std::unordered_set<std::string> trackedIcaos;
+    {
+        std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
+        trackedIcaos = std::move(trackedIcaos_);
+    }
+
+    if (trackedIcaos.empty()) return;
+
     std::unordered_set<std::string> iafList;
     {
         std::lock_guard<std::mutex> lock(iafMapMutex_);
         for (const auto& [icao, iafs] : iafMap_)
         {
-            iafList.insert(iafs.begin(), iafs.end());
+            if (trackedIcaos.contains(icao)) {
+                iafList.insert(iafs.begin(), iafs.end());
+            }
         }
     }
 
