@@ -148,6 +148,11 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
         // User provided ICAOs list or Position: example: .aman LFPG LFPO
         std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
         trackedICAOs_ = std::move(icaoList);
+        // The published IAF set is a function of this list, so ask OnTimer for a
+        // republish here. Only RefreshConfig raises the flag otherwise, which
+        // leaves the bridge showing the previous list for up to
+        // CONFIG_REFRESH_INTERVAL seconds.
+        iafUpdateRequired.store(true, std::memory_order_release);
         DisplayMessage("Tracking ICAOs updated.");
         return true;
     }
