@@ -307,7 +307,7 @@ void AMANPlugin::OnTimer(int Counter)
         std::unordered_set<std::string> trackedIcao;
         {
             std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
-            trackedIcao = std::move(trackedICAOs_);
+            trackedIcao = trackedICAOs_;
         }
 
         if (trackedIcao.empty()) return;
