@@ -868,7 +868,7 @@ void AMANPlugin::PublishIAFsToBridge()
     std::unordered_set<std::string> trackedIcaos;
     {
         std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
-        trackedIcaos = std::move(trackedIcaos_);
+        trackedIcaos = trackedICAOs_;
     }
 
     if (trackedIcaos.empty()) return;
