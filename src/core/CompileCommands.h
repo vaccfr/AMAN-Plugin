@@ -8,7 +8,8 @@
 #include <string>
 #include <algorithm>
 #include <sstream>
-
+#include <Windows.h>
+#include <Shellapi.h>
 #include <version.h>
 
 #include "AMANPlugin.h"
@@ -92,6 +93,18 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
         DisplayMessage(std::string("AMAN Plugin version: ") + PLUGIN_VERSION);
         return true;
     }
+    else if (sub == "open")
+    {
+        std::string url = "https://" + std::string(API_URL);
+        ShellExecute(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        return true;
+    }
+    else if (sub == "doc")
+    {
+        std::string url = "https://doc.vatsim.fr/en/atc/documentation/tools/aman";
+        ShellExecute(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        return true;
+    }
     else if (sub == "icao")
     {
         std::lock_guard<std::mutex> lock(trackedICAOsMutex_);
@@ -160,6 +173,8 @@ inline bool AMANPlugin::OnCompileCommand(const char* sCommandLine)
     // no command recognized, display help
     DisplayMessage("Commands: .aman version    Display AMAN Plugin version");
     DisplayMessage("Commands: .aman <ICAO1> <ICAO2> ...    Activate reporting for the specified ICAOs");
+    DisplayMessage("Commands: .aman open   Open AMAN interface in default web browser");
+    DisplayMessage("Commands: .aman doc    Open AMAN Doc in default browser");
     DisplayMessage("Commands: .aman icao    Display currently tracked ICAOs");
     DisplayMessage("Commands: .aman clear    Clear the list of tracked ICAOs");
     DisplayMessage("Commands: .aman available    Display the list of available ICAOs");

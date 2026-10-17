@@ -90,11 +90,16 @@ publish its IAF list or read ETAs.
 
 Typed into the EuroScope command line. The leading `.` is optional.
 
-| Command | Effect |
-|---|---|
-| `.aman version` | Prints the plugin version to the message window |
-| `.aman <ICAO> [ICAO ...]` | Replaces the tracked airport set |
-| `.aman` | Prints the command list |
+| Command                   | Effect                                          |
+|---------------------------|-------------------------------------------------|
+| `.aman version`           | Prints the plugin version to the message window |
+| `.aman open`              | Opens the AMAN interface in default browser     |
+| `.aman doc`               | Opens AMAN Documentation in default browser     |
+| `.aman available`         | Prints the available ICAOs                      |
+| `.aman icao`              | Prints the currently tracked ICAOs              |
+| `.aman clear`             | Clears the currently tracked ICAOs              |
+| `.aman <ICAO> [ICAO ...]` | Replaces the tracked airport set                |
+| `.aman`                   | Prints the command list                         |
 
 ```
 .aman LFPG LFPO
