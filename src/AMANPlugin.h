@@ -23,6 +23,8 @@
 
 #include <httplib.h>
 
+#include <esserverdetect.h>
+
 using namespace EuroScopePlugIn;
 
 struct ESB_Api_v1;
@@ -164,7 +166,14 @@ private:
     std::atomic<bool> m_stop{false};
     std::thread m_thread;
     std::atomic<bool> iafUpdateRequired{false};
+    // Effective network, not the raw GetConnectionType(): DIRECT means live VATSIM
+    // and SWEATBOX means SweatBox, as told by serverDetector_. NO while detection
+    // is still pending, so nothing is sent to the wrong endpoint meanwhile.
     std::atomic<int> connectionType{CONNECTION_TYPE_NO};
+
+    // Main thread only. EuroScope reports DIRECT for SweatBox whenever "Connect to
+    // VATSIM" is ticked, so the real server is read from the FSD socket instead.
+    essd::ServerDetector serverDetector_;
     std::atomic<bool> isController{false};
 
     // Bridge

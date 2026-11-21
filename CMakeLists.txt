@@ -25,7 +25,7 @@ if(VCPKG_TARGET_TRIPLET MATCHES "-md$")
         "their own and need no overrides.")
 endif()
 
-project(AMAN VERSION "1.0.5")
+project(AMAN VERSION "1.0.6")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,6 +87,7 @@ include_directories(
 # gets a separate copy and only one of them would ever be attached.
 set(SOURCES
     src/AMANPlugin.cpp
+    src/ServerDetect.cpp
 )
 
 # Headers carry the inline member definitions, so list them on the target: that is
@@ -136,6 +137,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # Third-party and warned about at /W4 like our own code would be, so keep it SYSTEM.
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/External/esbridge
+    ${CMAKE_SOURCE_DIR}/External/ServerDetect
+    ${CMAKE_SOURCE_DIR}/External/NeoChat
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 

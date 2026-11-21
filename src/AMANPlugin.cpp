@@ -16,6 +16,8 @@
 #include "version.h"
 #include "core/CompileCommands.h"
 
+#include <NeoChatClient.h>
+
 #define ESB_CLIENT_SHIM
 #include "esbridge.h"
 
@@ -28,6 +30,18 @@ static constexpr const char* PROVIDER_ID = "amanplugin";
 static constexpr const char* RWY_FIELD = "rwy";
 static constexpr const char* IAF_FIELD = "iaf";
 static constexpr const char* EAT_FIELD = "eat";
+
+/// Dot-commands registered with NeoChat for autocomplete. Keep in step with
+/// OnCompileCommand in core/CompileCommands.h.
+static const std::vector<const char*> NEOCHAT_COMMANDS = {
+    ".aman version",
+    ".aman open",
+    ".aman doc",
+    ".aman icao",
+    ".aman clear",
+    ".aman available",
+    ".aman <ICAO>",
+};
 
 /// CoFrance owns these. It integrates a wind-aware trajectory per flight, which
 /// this plugin does not, so the ETA over an IAF is read rather than computed.
@@ -173,6 +187,16 @@ std::unique_ptr<amanplugin::AMANPlugin> myPluginInstance = nullptr;
 AMANPlugin::AMANPlugin() : CPlugIn(EuroScopePlugIn::COMPATIBILITY_CODE, "AMAN", PLUGIN_VERSION, "French vACC", "Open Source")
 {
     m_stop.store(false, std::memory_order_relaxed);
+
+    // Main thread, from Update() in OnTimer.
+    serverDetector_.SetOnChange([this](const essd::ServerInfo& info) {
+        if (info.network != essd::Network::Vatsim && info.network != essd::Network::Sweatbox) return;
+        std::string msg = std::string("Connected to ") + essd::ToString(info.network);
+        if (!info.serverName.empty()) msg += " (" + info.serverName + ")";
+        if (info.fromFallback) msg += ", server not detected, using EuroScope connection type";
+        DisplayMessage(msg);
+    });
+
     Initialize();
 }
 
@@ -215,6 +239,8 @@ void AMANPlugin::Shutdown()
     // dupe flag with nobody left to maintain it is worse than no flag at all.
     if (api_ != nullptr && provider_ != nullptr) api_->unregister_provider(provider_);
 
+    NeoChat::UnregisterCommands(NEOCHAT_COMMANDS);
+
     DisplayMessage("AMAN Plugin shutdown complete");
 };
 
@@ -248,6 +274,30 @@ void AMANPlugin::QueueError(const std::string& message)
 
 void AMANPlugin::OnTimer(int Counter)
 {
+    // Idempotent, so it survives NeoChat loading after us or being reloaded.
+    NeoChat::RegisterCommands(NEOCHAT_COMMANDS);
+
+    // Resolve the real server. Ahead of the bridge on purpose: the endpoint the
+    // worker talks to must be right whether or not the bridge is loaded.
+    const int rawType = GetConnectionType();
+    serverDetector_.Update(rawType);
+
+    // Proxy and sim sessions stay out, as before: only the instance holding the
+    // FSD connection itself talks to the API.
+    int type = CONNECTION_TYPE_NO;
+    if (rawType == CONNECTION_TYPE_DIRECT || rawType == CONNECTION_TYPE_SWEATBOX)
+    {
+        if (serverDetector_.IsVatsim()) type = CONNECTION_TYPE_DIRECT;
+        else if (serverDetector_.IsSweatbox()) type = CONNECTION_TYPE_SWEATBOX;
+        // Pending: NO until resolved, so no snapshot lands on the wrong endpoint.
+    }
+    connectionType.store(type, std::memory_order_release);
+
+    // Only a controller the servers accept may amend flight plans, and there is
+    // no such thing offline or in a sim session.
+    const bool connected = type == CONNECTION_TYPE_DIRECT || type == CONNECTION_TYPE_SWEATBOX;
+    isController.store(connected && ControllerMyself().IsController(), std::memory_order_release);
+
     // bridge connection
     if (api_ == nullptr) {
         api_ = ESB_Attach();
@@ -266,18 +316,6 @@ void AMANPlugin::OnTimer(int Counter)
     if (provider_ == nullptr && !providerConflict_) RegisterProvider();
 
     if (cofranceEtaField_ == 0 || cofranceIafField_ == 0 || cofranceEatField_ == 0) ResolveConsumedFields();
-
-
-
-    // Update connection Type
-    const int type = GetConnectionType();
-    connectionType.store(type, std::memory_order_release);
-
-    // Only a controller the servers accept may amend flight plans, and there is
-    // no such thing offline or in a sim session.
-    const bool connected = type == CONNECTION_TYPE_DIRECT || type == CONNECTION_TYPE_SWEATBOX;
-    isController.store(connected && ControllerMyself().IsController(), std::memory_order_release);
-
 
     {
         // Drain message queue
