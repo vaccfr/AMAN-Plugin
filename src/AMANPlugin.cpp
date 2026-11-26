@@ -193,7 +193,14 @@ AMANPlugin::AMANPlugin() : CPlugIn(EuroScopePlugIn::COMPATIBILITY_CODE, "AMAN", 
         if (info.network != essd::Network::Vatsim && info.network != essd::Network::Sweatbox) return;
         std::string msg = std::string("Connected to ") + essd::ToString(info.network);
         if (!info.serverName.empty()) msg += " (" + info.serverName + ")";
-        if (info.fromFallback) msg += ", server not detected, using EuroScope connection type";
+        if (info.fromFallback) {
+            msg += info.remoteIp.empty() ? ", server not detected"
+                                         : ", unknown server " + info.remoteIp;
+            msg += ", using EuroScope connection type";
+        }
+        else {
+            msg += std::string(", via ") + essd::ToString(info.source);
+        }
         DisplayMessage(msg);
     });
 
